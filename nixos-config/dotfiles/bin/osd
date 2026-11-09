@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Minimal xob OSD driver.
+#
+#   osd <style> <value[!]>
+#
+# Sends a value (0-100) to a long-lived xob instance using the style named
+# in ~/.config/xob/styles.cfg. The instance is started on first use and kept
+# alive between key presses, so the bar appears instantly.
+#
+# A trailing "!" tells xob to use the style's dim "alt" colours (used for mute).
+
+set -u
+
+style=${1:?usage: osd <style> <value>}
+value=${2:?usage: osd <style> <value>}
+
+# Validate: digits, optionally followed by "!"
+[[ $value =~ ^[0-9]+!?$ ]] || { echo "osd: bad value '$value'" >&2; exit 1; }
+num=${value%!}
+(( num > 100 )) && num=100
+value=$num${value:${#num}}
+
+cfg=${XDG_CONFIG_HOME:-$HOME/.config}/xob/styles.cfg
+runtime=${XDG_RUNTIME_DIR:-/tmp}
+dir=$runtime/xob-osd
+fifo=$dir/$style.fifo
+pidfile=$dir/$style.pid
+
+mkdir -p "$dir" || exit 1
+
+alive() {
+    [[ -p $fifo && -f $pidfile ]] || return 1
+    local pid
+    pid=$(<"$pidfile")
+    [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null
+}
+
+start() {
+    rm -f "$fifo" "$pidfile"
+    mkfifo "$fifo" || return 1
+    # Hold the fifo open read-write inside the daemon: xob never sees EOF
+    # (which would make it quit) and writers never block.
+    setsid bash -c '
+        exec 3<>"$1" || exit 1
+        exec xob -m 100 -t 1200 -c "$2" -s "$3" <&3
+    ' _ "$fifo" "$cfg" "$style" >/dev/null 2>&1 &
+    echo $! >"$pidfile"
+}
+
+alive || start
+
+# Write the value; O_RDWR on the fifo means this never blocks.
+if ! { printf '%s\n' "$value" >&3; } 3<>"$fifo" 2>/dev/null; then
+    # Stale fifo/daemon: restart once and retry.
+    start
+    { printf '%s\n' "$value" >&3; } 3<>"$fifo" 2>/dev/null || exit 1
+fi

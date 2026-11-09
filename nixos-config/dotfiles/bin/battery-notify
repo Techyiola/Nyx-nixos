@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Battery-low desktop notification.
+#
+# Sends one notification when the battery drops to 15% while discharging,
+# then re-arms after the battery is charged back above 20%. Runs as a
+# long-lived process; see ~/.config/systemd/user/battery-notify.service.
+
+set -u
+
+sysfs=${BATTERY_SYSFS:-/sys/class/power_supply}
+threshold=${BATTERY_THRESHOLD:-15}
+rearm=${BATTERY_REARM:-20}
+interval=${BATTERY_INTERVAL:-30}
+
+# Find the first battery exposed by the kernel.
+find_battery() {
+    local d
+    for d in "$sysfs"/BAT*; do
+        [ -r "$d/capacity" ] && { printf '%s\n' "$d"; return 0; }
+    done
+    return 1
+}
+
+# True when mains power is connected (AC, or USB-C on some machines).
+ac_online() {
+    local d
+    for d in "$sysfs"/A{C,DC}*; do
+        [ -r "$d/online" ] || continue
+        [ "$(<"$d/online")" = 1 ] && return 0
+    done
+    return 1
+}
+
+notified=0
+
+while :; do
+    if ! bat=$(find_battery); then
+        sleep "$interval"
+        continue
+    fi
+
+    cap=$(<"$bat/capacity") 2>/dev/null || cap=""
+    status=$(<"$bat/status") 2>/dev/null || status=""
+
+    case $cap in
+        ''|*[!0-9]*)
+            sleep "$interval"
+            continue
+            ;;
+    esac
+
+    plugged=0
+    case $status in
+        Charging|Full|"Not charging") plugged=1 ;;
+        *) ac_online && plugged=1 ;;
+    esac
+
+    if [ "$plugged" -eq 1 ]; then
+        # Give the battery some headroom before arming the alert again.
+        [ "$cap" -ge "$rearm" ] && notified=0
+    elif [ "$cap" -le "$threshold" ] && [ "$notified" -eq 0 ]; then
+        notify-send -a "Battery" -u critical -i battery-caution \
+            "Battery low — ${cap}%" "Plug in the charger."
+        notified=1
+    fi
+
+    sleep "$interval"
+done

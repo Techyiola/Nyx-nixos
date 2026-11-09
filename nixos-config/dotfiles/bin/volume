@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Volume keys for i3: raise / lower / mute, with the minimal xob OSD.
+#
+#   volume up|down|mute
+#
+# Uses pamixer (works with PipeWire's pulse layer). Raising/lowering while
+# muted unmutes, which is what people expect from the hardware keys.
+
+set -u
+
+osd=$HOME/.local/bin/osd
+step=5
+
+case ${1:-} in
+    up)
+        pamixer --unmute
+        pamixer --increase "$step"
+        ;;
+    down)
+        pamixer --unmute
+        pamixer --decrease "$step"
+        ;;
+    mute)
+        pamixer --toggle-mute
+        ;;
+    *)
+        echo "usage: volume up|down|mute" >&2
+        exit 1
+        ;;
+esac
+
+vol=$(pamixer --get-volume 2>/dev/null) || vol=0
+[[ $vol =~ ^[0-9]+$ ]] || vol=0
+
+if [[ $(pamixer --get-mute 2>/dev/null) == true ]]; then
+    # Dim bar for the muted state via xob's "alt" colours.
+    "$osd" volume "${vol}!"
+else
+    "$osd" volume "$vol"
+fi

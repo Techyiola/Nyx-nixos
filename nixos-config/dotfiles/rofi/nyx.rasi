@@ -1,0 +1,126 @@
+/* Minimal monochrome rofi theme — matches the wallpaper, Ghostty and Polybar.
+ * NOTE: this rofi's built-in default theme is solarized/light, so every
+ * color-state variable below must be set explicitly to avoid light fallbacks. */
+
+* {
+    /* palette */
+    bg:      #0D0D0D;
+    bg-alt:  #161616;
+    fg:      #F0F0F0;
+    fg-dim:  #9A9A9A;
+    accent:  #3A3A3A;
+    border:  #2A2A2A;
+    urgent:  #F0F0F0;
+    red:     #4D4D4D;
+    blue:    #3A3A3A;
+    lightbg: #0D0D0D;
+    lightfg: #3A3A3A;
+
+    /* base */
+    background:       @bg;
+    foreground:       @fg;
+    background-color: @bg;
+    text-color:       @fg;
+    border-radius:    0px;
+    font:             "JetBrainsMono Nerd Font 10";
+
+    /* list row states — force monochrome (override solarized defaults) */
+    normal-background:           @bg;
+    normal-foreground:           @fg-dim;
+    alternate-normal-background: @bg;
+    alternate-normal-foreground: @fg-dim;
+
+    selected-normal-background:  @accent;
+    selected-normal-foreground:  @fg;
+
+    urgent-background:           @bg;
+    urgent-foreground:           @urgent;
+    selected-urgent-background:  @accent;
+    selected-urgent-foreground:  @fg;
+    alternate-urgent-background: @bg;
+    alternate-urgent-foreground: @urgent;
+
+    active-background:           @bg;
+    active-foreground:           @fg;
+    selected-active-background:  @accent;
+    selected-active-foreground:  @fg;
+    alternate-active-background: @bg;
+    alternate-active-foreground: @fg;
+
+    separatorcolor: @border;
+}
+
+window {
+    width:            36%;
+    padding:          8px;
+    border:           1px solid;
+    border-color:     @border;
+    background-color: @bg;
+}
+
+mainbox {
+    padding: 0;
+}
+
+listview {
+    lines:      10;
+    columns:    1;
+    spacing:    6px;
+    scrollbar:  false;
+    padding:    4px;
+}
+
+element {
+    padding:          6px;
+    background-color: transparent;
+    text-color:       @fg-dim;
+}
+
+element selected {
+    background-color: @accent;
+    text-color:       @fg;
+}
+
+element-icon,
+element-text {
+    background-color: inherit;
+    text-color:       inherit;
+    vertical-align:   0.5;
+}
+
+inputbar {
+    padding:          6px;
+    background-color: @bg-alt;
+    text-color:       @fg;
+    border:           1px solid;
+    border-color:     @border;
+}
+
+prompt {
+    padding:          0 6px 0 0;
+    background-color: @bg-alt;
+    text-color:       @accent;
+}
+
+entry {
+    background-color:   @bg-alt;
+    text-color:         @fg;
+    placeholder:        "Search…";
+    placeholder-color:  @fg-dim;
+}
+
+mode-switcher {
+    spacing: 0;
+}
+
+button {
+    padding:          6px;
+    background-color: @bg-alt;
+    text-color:       @fg-dim;
+    border:           0px;
+}
+
+button selected {
+    background-color: @accent;
+    text-color:       @fg;
+}

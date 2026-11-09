@@ -1,0 +1,1860 @@
+#!/usr/bin/env python3
+"""
+screenshot — a small, monochrome screenshot utility for the i3 rice.
+
+Why this exists
+---------------
+The i3 config has always had the three Print-key bindings, but the script they
+call did not.  This is that script, with the rest of the workflow filled in:
+
+    screenshot region      select an area, annotate it, copy and/or save
+    screenshot window      capture the focused window, then annotate
+    screenshot full        grab the whole screen straight to the clipboard
+    screenshot save        grab the whole screen, save it and copy it
+    screenshot menu        rofi menu with all of the above (+ delayed capture)
+
+The selector and editor are plain GTK 3 + Cairo, so they follow the rice's
+palette (#0D0D0D / #C8C8C8 / #2A2A2A) instead of dragging in another toolkit.
+ImageMagick's `import` is used for the actual X11 grab.  Clipboard images are
+served by a tiny long-lived helper (the same trick `xclip` uses) so they stay
+pasteable after this process exits.  Notifications go through dunst.
+
+Handy details
+-------------
+* The screen is captured *before* the selector is shown, so the overlay can
+  never end up in the screenshot.
+* Hold Shift while dragging to constrain a box to a square, or an arrow to
+  45-degree increments.
+* In the editor: A/R/O/P/T/B select tools, Ctrl+Z undo, Ctrl+Shift+Z redo,
+  Ctrl+C copy, Ctrl+S save, Enter copy & save, Esc discard.
+* Saved files land in ~/Pictures/Screenshots unless SCREENSHOT_DIR is set.
+
+Diagnostics:  screenshot --doctor
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import warnings
+
+# GTK 3's set_wmclass is the only portable way to pick a stable i3 match
+# class; the deprecation noise is not useful here.
+warnings.filterwarnings(
+    "ignore", category=DeprecationWarning, message=r"Gtk\.Window\.set_wmclass is deprecated"
+)
+
+APP_NAME = "Screenshots"
+APP_VERSION = "1.0"
+
+# Match the rest of the rice.
+BG = "#0D0D0D"
+BG_ALT = "#121212"
+FG = "#F0F0F0"
+FG_DIM = "#9A9A9A"
+ACCENT = "#C8C8C8"
+BORDER = "#2A2A2A"
+
+TOOLS = (
+    ("arrow", "↗", "Arrow"),
+    ("rect", "▭", "Rectangle"),
+    ("ellipse", "◯", "Ellipse"),
+    ("pen", "✎", "Pen"),
+    ("text", "T", "Text"),
+    ("pixelate", "▦", "Pixelate / redact"),
+)
+
+TOOL_HINTS = {
+    "arrow": "Drag to draw an arrow",
+    "rect": "Drag to draw a rectangle",
+    "ellipse": "Drag to draw an ellipse",
+    "pen": "Drag to draw freehand",
+    "text": "Click to place text",
+    "pixelate": "Drag over an area to pixelate it",
+}
+
+SHORTCUT_HINT = "Ctrl+Z undo  ·  Ctrl+C copy  ·  Ctrl+S save  ·  Enter copy & save  ·  Esc discard"
+
+COLORS = (
+    ("Red", "#E5484D"),
+    ("White", "#F0F0F0"),
+    ("Yellow", "#F5C542"),
+    ("Green", "#46A758"),
+    ("Blue", "#4C8DFF"),
+    ("Black", "#0D0D0D"),
+)
+
+try:
+    import gi
+
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    gi.require_version("GdkPixbuf", "2.0")
+    gi.require_version("Pango", "1.0")
+    gi.require_version("PangoCairo", "1.0")
+    from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango, PangoCairo
+
+    import cairo
+except Exception as exc:  # pragma: no cover - only on a broken install
+    sys.stderr.write(
+        "screenshot: GTK 3, PyGObject and python-cairo are required.\n"
+        f"  {exc}\n"
+        "  On Arch/CachyOS: sudo pacman -S python-gobject gtk3 python-cairo\n"
+    )
+    raise SystemExit(2)
+
+
+# ---------------------------------------------------------------------------
+# small helpers
+# ---------------------------------------------------------------------------
+
+
+def runtime_dir() -> str:
+    base = os.environ.get("XDG_RUNTIME_DIR") or os.path.join(
+        tempfile.gettempdir(), f"screenshot-{os.getuid()}"
+    )
+    path = os.path.join(base, "screenshot")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
+def log(message: str) -> None:
+    try:
+        with open(os.path.join(runtime_dir(), "screenshot.log"), "a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except OSError:
+        pass
+
+
+def notify(summary: str, body: str = "", icon: str | None = None, urgency: str = "normal") -> None:
+    if not shutil.which("notify-send"):
+        return
+    cmd = [
+        "notify-send",
+        "-a",
+        APP_NAME,
+        "-u",
+        urgency,
+        "-t",
+        "5000",
+        "-h",
+        "string:x-canonical-private-synchronous:screenshot",
+    ]
+    if icon:
+        cmd += ["-i", icon]
+    cmd.append(summary)
+    if body:
+        cmd.append(body)
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def fail(message: str, detail: str = "") -> int:
+    log(f"error: {message} {detail}".strip())
+    sys.stderr.write(f"screenshot: {message}\n")
+    if detail:
+        sys.stderr.write(f"  {detail}\n")
+    notify("Screenshot failed", message + (f"\n{detail}" if detail else ""), icon="dialog-error", urgency="critical")
+    return 1
+
+
+def pictures_dir() -> str:
+    override = os.environ.get("SCREENSHOT_DIR")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    try:
+        out = subprocess.check_output(["xdg-user-dir", "PICTURES"], text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        out = ""
+    if not out or out == os.path.expanduser("~"):
+        out = os.path.join(os.path.expanduser("~"), "Pictures")
+    return os.path.join(out, "Screenshots")
+
+
+def unique_path(directory: str, prefix: str = "Screenshot") -> str:
+    os.makedirs(directory, mode=0o755, exist_ok=True)
+    stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    base = f"{prefix}_{stamp}"
+    path = os.path.join(directory, base + ".png")
+    n = 2
+    while os.path.exists(path):
+        path = os.path.join(directory, f"{base}_{n}.png")
+        n += 1
+    return path
+
+
+def resolve_save_path(opts) -> str:
+    """Turn --path (file or directory) into a concrete, absolute PNG path."""
+    if not opts.path:
+        return unique_path(pictures_dir())
+    path = os.path.abspath(os.path.expanduser(opts.path))
+    if opts.path.endswith(os.sep) or os.path.isdir(path):
+        return unique_path(path)
+    return path
+
+
+def temp_png(prefix: str = "tmp-") -> str:
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=".png", dir=runtime_dir())
+    os.close(fd)
+    return path
+
+
+def hex_to_rgb(value: str) -> tuple[float, float, float]:
+    value = value.lstrip("#")
+    if len(value) == 3:
+        value = "".join(c * 2 for c in value)
+    return tuple(int(value[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+
+def rounded_rect(cr, x: float, y: float, w: float, h: float, r: float) -> None:
+    r = max(0.0, min(r, w / 2.0, h / 2.0))
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def draw_label(cr, text: str, x: float, y: float, *, size: int = 10, color: str = FG,
+               bold: bool = False, box: bool = False, padding: int = 7) -> tuple[int, int]:
+    """Draw a Pango label; optionally put it on a rounded dark chip."""
+    desc = Pango.FontDescription(f"JetBrainsMono Nerd Font {'Bold ' if bold else ''}{size}")
+    layout = PangoCairo.create_layout(cr)
+    layout.set_font_description(desc)
+    layout.set_text(text, -1)
+    tw, th = layout.get_pixel_size()
+    if box:
+        bx, by = x - padding, y - padding
+        bw, bh = tw + padding * 2, th + padding * 2
+        cr.set_source_rgba(0.05, 0.05, 0.05, 0.88)
+        rounded_rect(cr, bx, by, bw, bh, 4)
+        cr.fill()
+        cr.set_source_rgba(0.16, 0.16, 0.16, 1)
+        cr.set_line_width(1)
+        rounded_rect(cr, bx + 0.5, by + 0.5, bw - 1, bh - 1, 4)
+        cr.stroke()
+    cr.set_source_rgb(*hex_to_rgb(color))
+    cr.move_to(x, y)
+    PangoCairo.show_layout(cr, layout)
+    return tw, th
+
+
+# ---------------------------------------------------------------------------
+# X11 capture
+# ---------------------------------------------------------------------------
+
+
+def capture_root_pixbuf() -> GdkPixbuf.Pixbuf:
+    path = os.path.join(runtime_dir(), "capture-root.png")
+    proc = subprocess.run(
+        ["import", "-quiet", "-silent", "-window", "root", path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode != 0 or not os.path.exists(path):
+        raise RuntimeError(proc.stderr.strip() or "ImageMagick could not capture the screen")
+    try:
+        return GdkPixbuf.Pixbuf.new_from_file(path)
+    finally:
+        # The pixels are in the pixbuf now, so drop the temporary PNG.
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _walk_i3(node: dict):
+    if node.get("focused") and node.get("window"):
+        return node
+    for key in ("nodes", "floating_nodes"):
+        for child in node.get(key) or []:
+            found = _walk_i3(child)
+            if found:
+                return found
+    return None
+
+
+def focused_window_info() -> dict | None:
+    if shutil.which("i3-msg"):
+        try:
+            tree = json.loads(
+                subprocess.check_output(["i3-msg", "-t", "get_tree"], text=True, timeout=3)
+            )
+            node = _walk_i3(tree)
+            if node:
+                return node
+        except Exception:
+            pass
+
+    if shutil.which("xprop"):
+        try:
+            out = subprocess.check_output(["xprop", "-root", "_NET_ACTIVE_WINDOW"], text=True, timeout=3)
+            match = re.search(r"#\s*(0x[0-9a-fA-F]+|\d+)", out)
+            if match:
+                return {"window": int(match.group(1), 0), "name": "focused window"}
+        except Exception:
+            pass
+    return None
+
+
+def capture_window_pixbuf() -> GdkPixbuf.Pixbuf:
+    info = focused_window_info()
+    if not info:
+        raise RuntimeError("No focused window was found")
+    path = os.path.join(runtime_dir(), "capture-window.png")
+    proc = subprocess.run(
+        ["import", "-quiet", "-silent", "-window", str(info["window"]), path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode == 0 and os.path.exists(path):
+        try:
+            return GdkPixbuf.Pixbuf.new_from_file(path)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    # Fallback for a window ImageMagick cannot grab directly: take the screen
+    # and crop to i3's geometry for the focused container.
+    rect = info.get("rect") or {}
+    if all(k in rect for k in ("x", "y", "width", "height")):
+        root = capture_root_pixbuf()
+        return crop_pixbuf(root, rect["x"], rect["y"], rect["width"], rect["height"])
+    raise RuntimeError(proc.stderr.strip() or "ImageMagick could not capture the focused window")
+
+
+def crop_pixbuf(pixbuf: GdkPixbuf.Pixbuf, x: int, y: int, w: int, h: int) -> GdkPixbuf.Pixbuf:
+    iw, ih = pixbuf.get_width(), pixbuf.get_height()
+    x = max(0, min(int(x), iw - 1))
+    y = max(0, min(int(y), ih - 1))
+    w = max(1, min(int(w), iw - x))
+    h = max(1, min(int(h), ih - y))
+    return pixbuf.new_subpixbuf(x, y, w, h).copy()
+
+
+def surface_for(pixbuf: GdkPixbuf.Pixbuf):
+    return Gdk.cairo_surface_create_from_pixbuf(pixbuf, 1, None)
+
+
+# ---------------------------------------------------------------------------
+# Clipboard helper (a tiny persistent owner, like xclip)
+# ---------------------------------------------------------------------------
+
+
+def _clip_paths() -> tuple[str, str]:
+    d = runtime_dir()
+    return os.path.join(d, "clipboard.fifo"), os.path.join(d, "clipboard.pid")
+
+
+def _clip_alive() -> bool:
+    fifo, pidfile = _clip_paths()
+    if not (os.path.exists(fifo) and os.path.exists(pidfile)):
+        return False
+    try:
+        pid = int(open(pidfile, encoding="utf-8").read().strip())
+        os.kill(pid, 0)
+    except Exception:
+        return False
+    # Guard against PID reuse: the owner must still be our daemon.
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            cmdline = fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        return True
+    return "screenshot" in cmdline and "--clipboard-daemon" in cmdline
+
+
+def _start_clip_daemon() -> None:
+    # The daemon creates the fifo and pidfile itself, under a lock, so two
+    # simultaneous "copy" actions can never end up with two owners.
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--clipboard-daemon"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    for _ in range(40):
+        if _clip_alive():
+            return
+        time.sleep(0.05)
+    raise RuntimeError("clipboard helper did not start")
+
+
+def copy_to_clipboard(path: str) -> bool:
+    """Send an image path to the clipboard owner.  Returns False on failure."""
+    if not _clip_alive():
+        try:
+            _start_clip_daemon()
+        except Exception as exc:
+            log(f"clipboard daemon: {exc}")
+            return _fallback_clipboard(path)
+    fifo, _ = _clip_paths()
+    try:
+        fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            os.write(fd, (path + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+        return True
+    except OSError as exc:
+        log(f"clipboard write: {exc}")
+        try:
+            _start_clip_daemon()
+            fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+            try:
+                os.write(fd, (path + "\n").encode("utf-8"))
+            finally:
+                os.close(fd)
+            return True
+        except Exception as exc2:
+            log(f"clipboard retry: {exc2}")
+            return _fallback_clipboard(path)
+
+
+def _fallback_clipboard(path: str) -> bool:
+    if shutil.which("xclip"):
+        return subprocess.run(
+            ["xclip", "-selection", "clipboard", "-t", "image/png", "-i", path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode == 0
+    if shutil.which("wl-copy"):
+        with open(path, "rb") as fh:
+            return subprocess.run(
+                ["wl-copy", "--type", "image/png"],
+                stdin=fh,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode == 0
+    return False
+
+
+def clipboard_daemon() -> int:
+    Gtk.init([])
+    fifo, pidfile = _clip_paths()
+
+    # Single instance: i3 may exec this at login and again on every reload.
+    lock_path = os.path.join(runtime_dir(), "clipboard.lock")
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(lock_fd)
+        return 0
+
+    # We own the clipboard now: replace any stale fifo/pidfile left by a
+    # previous session.
+    for path in (fifo, pidfile):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    os.mkfifo(fifo, 0o600)
+
+    clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+    state: dict[str, object] = {"pixbuf": None}
+
+    def serve(path: str) -> bool:
+        try:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
+            state["pixbuf"] = pixbuf
+            clipboard.set_image(pixbuf)
+            # A copy-only screenshot is a throwaway file; the daemon has the
+            # pixels now, so clean it up.  Saved screenshots are left alone.
+            if os.path.basename(path).startswith("tmp-"):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        except Exception as exc:
+            log(f"clipboard load {path}: {exc}")
+        return False
+
+    fd = os.open(fifo, os.O_RDWR)  # O_RDWR keeps the fifo alive without writers
+
+    # Publish the pid only after the fifo is open: clients wait for this file
+    # before writing, so they can never lose a copy to a startup race.
+    try:
+        with open(pidfile, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+    except OSError:
+        pass
+
+    stop = {"flag": False}
+
+    def reader() -> None:
+        buf = b""
+        while not stop["flag"]:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                break
+            if not data:
+                continue
+            buf += data
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                path = line.decode("utf-8", "replace").strip()
+                if path:
+                    GLib.idle_add(serve, path)
+
+    threading.Thread(target=reader, daemon=True, name="clipboard-reader").start()
+
+    def quit_daemon(*_args) -> None:
+        stop["flag"] = True
+        Gtk.main_quit()
+
+    signal.signal(signal.SIGTERM, quit_daemon)
+    signal.signal(signal.SIGINT, quit_daemon)
+    try:
+        Gtk.main()
+    finally:
+        try:
+            os.unlink(pidfile)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Region selector
+# ---------------------------------------------------------------------------
+
+
+def monitor_geometry(pixbuf: GdkPixbuf.Pixbuf) -> tuple[int, int, int, int]:
+    """The output under the pointer, clamped to the captured root image."""
+    iw, ih = pixbuf.get_width(), pixbuf.get_height()
+    try:
+        display = Gdk.Display.get_default()
+        _seat_screen, px, py = display.get_default_seat().get_pointer().get_position()
+        monitor = display.get_monitor_at_point(px, py) or display.get_primary_monitor()
+        geo = monitor.get_geometry()
+        x, y, w, h = geo.x, geo.y, geo.width, geo.height
+    except Exception:
+        return 0, 0, iw, ih
+    x = max(0, min(int(x), iw - 1))
+    y = max(0, min(int(y), ih - 1))
+    w = max(1, min(int(w), iw - x))
+    h = max(1, min(int(h), ih - y))
+    return x, y, w, h
+
+
+class RegionSelector(Gtk.Window):
+    """Full-screen dimmed selector using the pre-captured desktop as backdrop."""
+
+    def __init__(self, pixbuf: GdkPixbuf.Pixbuf):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.origin_x, self.origin_y, mw, mh = monitor_geometry(pixbuf)
+        self.pixbuf = crop_pixbuf(pixbuf, self.origin_x, self.origin_y, mw, mh)
+        self.surface = surface_for(self.pixbuf)
+        self.sw = self.pixbuf.get_width()
+        self.sh = self.pixbuf.get_height()
+        self.result: tuple[int, int, int, int] | None = None
+        self.start: tuple[int, int] | None = None
+        self.end: tuple[int, int] | None = None
+        self.dragging = False
+        self.grabbed = False
+        self.done = False
+
+        self.set_app_paintable(True)
+        self.set_decorated(False)
+        self.set_resizable(False)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_keep_above(True)
+        self.set_accept_focus(True)
+        self.set_can_focus(True)
+        self.set_wmclass("screenshot-overlay", "screenshot-overlay")
+        self.set_default_size(self.sw, self.sh)
+        self.move(self.origin_x, self.origin_y)
+        # Fullscreen (rather than a DOCK/override-redirect window) lets i3 put
+        # the selector over the polybar too, so the whole output is selectable.
+        self.fullscreen()
+
+        self.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+            | Gdk.EventMask.KEY_PRESS_MASK
+            | Gdk.EventMask.KEY_RELEASE_MASK
+            | Gdk.EventMask.STRUCTURE_MASK
+        )
+        self.connect("draw", self.on_draw)
+        self.connect("map-event", self.on_map)
+        self.connect("destroy", self.on_destroy)
+        self.connect("button-press-event", self.on_press)
+        self.connect("button-release-event", self.on_release)
+        self.connect("motion-notify-event", self.on_motion)
+        self.connect("key-press-event", self.on_key)
+        self.connect("key-release-event", self.on_key_release)
+
+    # -- lifecycle ---------------------------------------------------------
+    def on_map(self, _widget, _event):
+        window = self.get_window()
+        if window is None:
+            return False
+        cursor = Gdk.Cursor.new_from_name(self.get_display(), "crosshair")
+        window.set_cursor(cursor)
+        seat = self.get_display().get_default_seat()
+        status = seat.grab(
+            window, Gdk.SeatCapabilities.ALL, False, cursor, None, None, None
+        )
+        self.grabbed = status == Gdk.GrabStatus.SUCCESS
+        if not self.grabbed:
+            try:
+                window.focus(Gdk.CURRENT_TIME)
+            except Exception:
+                pass
+        return False
+
+    def _ungrab(self) -> None:
+        if not self.grabbed:
+            return
+        try:
+            self.get_display().get_default_seat().ungrab()
+        except Exception:
+            pass
+        self.grabbed = False
+
+    def on_destroy(self, *_args):
+        self._ungrab()
+        if not self.done:
+            # Closed by something other than finish() (e.g. the WM): make sure
+            # the selector's nested main loop does not leave the process stuck.
+            self.done = True
+            self.result = None
+            GLib.idle_add(Gtk.main_quit)
+
+    def finish(self, rect: tuple[int, int, int, int] | None) -> None:
+        if self.done:
+            return
+        self.done = True
+        if rect is not None:
+            rect = (
+                rect[0] + self.origin_x,
+                rect[1] + self.origin_y,
+                rect[2],
+                rect[3],
+            )
+        self.result = rect
+        self._ungrab()
+        self.destroy()
+        GLib.idle_add(Gtk.main_quit)
+
+    # -- geometry ----------------------------------------------------------
+    def selection_rect(self) -> tuple[int, int, int, int] | None:
+        if self.start is None or self.end is None:
+            return None
+        x1, y1 = self.start
+        x2, y2 = self.end
+        x, y = min(x1, x2), min(y1, y2)
+        w, h = abs(x2 - x1), abs(y2 - y1)
+        if w < 1 or h < 1:
+            return None
+        return x, y, w, h
+
+    def _clamp(self, x: int, y: int) -> tuple[int, int]:
+        return max(0, min(x, self.sw)), max(0, min(y, self.sh))
+
+    # -- events ------------------------------------------------------------
+    def on_press(self, _widget, event):
+        if event.button == 1:
+            x, y = self._clamp(int(event.x), int(event.y))
+            self.start = (x, y)
+            self.end = (x, y)
+            self.dragging = True
+            self.queue_draw()
+        elif event.button == 3:
+            self.finish(None)
+        return True
+
+    def on_motion(self, _widget, event):
+        if not self.dragging or self.start is None:
+            return True
+        x, y = self._clamp(int(event.x), int(event.y))
+        if event.state & Gdk.ModifierType.SHIFT_MASK:
+            dx = x - self.start[0]
+            dy = y - self.start[1]
+            side = max(abs(dx), abs(dy))
+            x = self.start[0] + (side if dx >= 0 else -side)
+            y = self.start[1] + (side if dy >= 0 else -side)
+            x, y = self._clamp(x, y)
+        self.end = (x, y)
+        self.queue_draw()
+        return True
+
+    def on_release(self, _widget, event):
+        if event.button != 1 or not self.dragging:
+            return True
+        self.dragging = False
+        rect = self.selection_rect()
+        if rect and rect[2] >= 3 and rect[3] >= 3:
+            self.finish(rect)
+        else:
+            self.start = self.end = None
+            self.queue_draw()
+        return True
+
+    def on_key(self, _widget, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.finish(None)
+            return True
+        if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            rect = self.selection_rect()
+            if rect and rect[2] >= 3 and rect[3] >= 3:
+                self.finish(rect)
+                return True
+        return False
+
+    def on_key_release(self, _widget, _event):
+        return False
+
+    # -- painting ----------------------------------------------------------
+    def on_draw(self, _widget, cr):
+        cr.set_source_surface(self.surface, 0, 0)
+        cr.paint()
+
+        rect = self.selection_rect()
+        cr.set_source_rgba(0.03, 0.03, 0.03, 0.58)
+        cr.rectangle(0, 0, self.sw, self.sh)
+        cr.fill()
+
+        if rect:
+            x, y, w, h = rect
+            # Punch the selection out of the dim layer.
+            cr.save()
+            cr.rectangle(x, y, w, h)
+            cr.clip()
+            cr.set_source_surface(self.surface, 0, 0)
+            cr.paint()
+            cr.restore()
+
+            cr.set_source_rgba(0.78, 0.78, 0.78, 1)
+            cr.set_line_width(1)
+            cr.rectangle(x + 0.5, y + 0.5, max(0, w - 1), max(0, h - 1))
+            cr.stroke()
+
+            for hx, hy in ((x, y), (x + w, y), (x, y + h), (x + w, y + h)):
+                cr.set_source_rgba(0.94, 0.94, 0.94, 1)
+                cr.rectangle(hx - 2.5, hy - 2.5, 5, 5)
+                cr.fill()
+                cr.set_source_rgba(0.08, 0.08, 0.08, 1)
+                cr.rectangle(hx - 2.5, hy - 2.5, 5, 5)
+                cr.set_line_width(1)
+                cr.stroke()
+
+            label = f"{w} × {h}"
+            layout = PangoCairo.create_layout(cr)
+            layout.set_font_description(Pango.FontDescription("JetBrainsMono Nerd Font Bold 10"))
+            layout.set_text(label, -1)
+            tw, th = layout.get_pixel_size()
+            pad = 7
+            lx = x + w - tw - pad * 2
+            ly = y - th - pad * 2 - 6
+            if ly < 4:
+                ly = y + 6
+            if lx < 4:
+                lx = x + 6
+            cr.set_source_rgba(0.05, 0.05, 0.05, 0.9)
+            rounded_rect(cr, lx, ly, tw + pad * 2, th + pad * 2, 4)
+            cr.fill()
+            cr.set_source_rgba(0.16, 0.16, 0.16, 1)
+            cr.set_line_width(1)
+            rounded_rect(cr, lx + 0.5, ly + 0.5, tw + pad * 2 - 1, th + pad * 2 - 1, 4)
+            cr.stroke()
+            cr.set_source_rgb(*hex_to_rgb(FG))
+            cr.move_to(lx + pad, ly + pad)
+            PangoCairo.show_layout(cr, layout)
+        else:
+            text = "Click and drag to select   ·   Esc to cancel"
+            layout = PangoCairo.create_layout(cr)
+            layout.set_font_description(Pango.FontDescription("JetBrainsMono Nerd Font 10"))
+            layout.set_text(text, -1)
+            tw, th = layout.get_pixel_size()
+            pad = 12
+            bx = (self.sw - tw) / 2 - pad
+            by = (self.sh - th) / 2 - pad
+            cr.set_source_rgba(0.05, 0.05, 0.05, 0.86)
+            rounded_rect(cr, bx, by, tw + pad * 2, th + pad * 2, 5)
+            cr.fill()
+            cr.set_source_rgba(0.16, 0.16, 0.16, 1)
+            cr.set_line_width(1)
+            rounded_rect(cr, bx + 0.5, by + 0.5, tw + pad * 2 - 1, th + pad * 2 - 1, 5)
+            cr.stroke()
+            cr.set_source_rgb(*hex_to_rgb(FG_DIM))
+            cr.move_to(bx + pad, by + pad)
+            PangoCairo.show_layout(cr, layout)
+        return False
+
+    @classmethod
+    def select(cls, pixbuf: GdkPixbuf.Pixbuf) -> tuple[int, int, int, int] | None:
+        selector = cls(pixbuf)
+        selector.show_all()
+        selector.present()
+        Gtk.main()
+        return selector.result
+
+
+# ---------------------------------------------------------------------------
+# Annotation editor
+# ---------------------------------------------------------------------------
+
+
+def draw_arrow(cr, shape: dict) -> None:
+    x1, y1 = shape["x1"], shape["y1"]
+    x2, y2 = shape["x2"], shape["y2"]
+    color = shape["color"]
+    width = shape["width"]
+    angle = math.atan2(y2 - y1, x2 - x1)
+    head = max(12.0, width * 4.5)
+
+    # Body, with a soft dark halo so it reads on light and dark images.
+    for lw, col in ((width + 2.0, (0, 0, 0, 0.35)), (width, color)):
+        cr.set_line_width(lw)
+        cr.set_source_rgba(*col)
+        cr.move_to(x1, y1)
+        cr.line_to(x2 - math.cos(angle) * head * 0.65, y2 - math.sin(angle) * head * 0.65)
+        cr.stroke()
+
+    left = (x2 - head * math.cos(angle - 0.42), y2 - head * math.sin(angle - 0.42))
+    right = (x2 - head * math.cos(angle + 0.42), y2 - head * math.sin(angle + 0.42))
+    cr.move_to(x2, y2)
+    cr.line_to(*left)
+    cr.line_to(*right)
+    cr.close_path()
+    cr.set_source_rgba(0, 0, 0, 0.35)
+    cr.set_line_width(max(2.0, width * 0.8))
+    cr.stroke_preserve()
+    cr.set_source_rgba(*color)
+    cr.fill()
+
+
+def draw_rect_shape(cr, shape: dict, ellipse: bool = False) -> None:
+    x1, y1 = shape["x1"], shape["y1"]
+    x2, y2 = shape["x2"], shape["y2"]
+    x, y = min(x1, x2), min(y1, y2)
+    w, h = abs(x2 - x1), abs(y2 - y1)
+    if w < 1 or h < 1:
+        return
+    color, width = shape["color"], shape["width"]
+    for lw, col in ((width + 2.0, (0, 0, 0, 0.35)), (width, color)):
+        cr.set_line_width(lw)
+        cr.set_source_rgba(*col)
+        if ellipse:
+            cr.save()
+            cr.translate(x + w / 2, y + h / 2)
+            cr.scale(max(w / 2, 0.1), max(h / 2, 0.1))
+            cr.arc(0, 0, 1, 0, math.tau)
+            cr.restore()
+            cr.stroke()
+        else:
+            cr.rectangle(x, y, w, h)
+            cr.stroke()
+
+
+def draw_pen(cr, shape: dict) -> None:
+    points = shape["points"]
+    if len(points) < 2:
+        return
+    color, width = shape["color"], shape["width"]
+    for lw, col in ((width + 2.0, (0, 0, 0, 0.35)), (width, color)):
+        cr.set_line_width(lw)
+        cr.set_source_rgba(*col)
+        cr.move_to(*points[0])
+        for point in points[1:]:
+            cr.line_to(*point)
+        cr.stroke()
+
+
+def draw_text(cr, shape: dict) -> None:
+    text = shape.get("text", "")
+    if not text:
+        return
+    size = shape.get("size", 24)
+    desc = Pango.FontDescription(f"JetBrainsMono Nerd Font Bold {size}")
+    layout = PangoCairo.create_layout(cr)
+    layout.set_font_description(desc)
+    layout.set_text(text, -1)
+    x, y = shape["x"], shape["y"]
+    cr.save()
+    cr.translate(x + 1.5, y + 1.5)
+    cr.set_source_rgba(0, 0, 0, 0.55)
+    PangoCairo.show_layout(cr, layout)
+    cr.restore()
+    cr.save()
+    cr.translate(x, y)
+    cr.set_source_rgba(*shape["color"])
+    PangoCairo.show_layout(cr, layout)
+    cr.restore()
+
+
+def draw_pixelate(cr, shape: dict, base_surface) -> None:
+    x1, y1 = shape["x1"], shape["y1"]
+    x2, y2 = shape["x2"], shape["y2"]
+    x, y = min(x1, x2), min(y1, y2)
+    w, h = abs(x2 - x1), abs(y2 - y1)
+    if w < 3 or h < 3 or base_surface is None:
+        return
+    block = max(6, int(shape["width"] * 3))
+    sw = max(1, int(w / block))
+    sh = max(1, int(h / block))
+    tmp = cairo.ImageSurface(cairo.FORMAT_ARGB32, sw, sh)
+    tctx = cairo.Context(tmp)
+    tctx.scale(sw / w, sh / h)
+    tctx.set_source_surface(base_surface, -x, -y)
+    tctx.get_source().set_filter(cairo.FILTER_BILINEAR)
+    tctx.paint()
+    cr.save()
+    cr.rectangle(x, y, w, h)
+    cr.clip()
+    cr.translate(x, y)
+    cr.scale(w / sw, h / sh)
+    cr.set_source_surface(tmp, 0, 0)
+    cr.get_source().set_filter(cairo.FILTER_NEAREST)
+    cr.paint()
+    cr.restore()
+
+
+def draw_shape(cr, shape: dict, base_surface=None) -> None:
+    kind = shape["type"]
+    cr.save()
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    if kind == "arrow":
+        draw_arrow(cr, shape)
+    elif kind == "rect":
+        draw_rect_shape(cr, shape, ellipse=False)
+    elif kind == "ellipse":
+        draw_rect_shape(cr, shape, ellipse=True)
+    elif kind == "pen":
+        draw_pen(cr, shape)
+    elif kind == "text":
+        draw_text(cr, shape)
+    elif kind == "pixelate":
+        draw_pixelate(cr, shape, base_surface)
+    cr.restore()
+
+
+EDITOR_CSS = b"""
+window { background-color: #0D0D0D; font-family: "JetBrainsMono Nerd Font"; }
+.toolbar {
+    background-color: #121212;
+    border-bottom: 1px solid #2A2A2A;
+    padding: 6px 8px;
+}
+.toolbar button {
+    background: #171717;
+    color: #CFCFCF;
+    border: 1px solid #2A2A2A;
+    border-radius: 3px;
+    padding: 4px 8px;
+    min-height: 0;
+}
+.toolbar button:hover { background: #222222; color: #F0F0F0; }
+.toolbar button:checked {
+    background: #C8C8C8;
+    color: #0D0D0D;
+    border-color: #C8C8C8;
+}
+.toolbar button.tool { font-size: 14px; padding: 2px 10px; }
+.toolbar button.swatch {
+    background: #0D0D0D;
+    border-color: #2A2A2A;
+    padding: 1px;
+    min-width: 0;
+}
+.toolbar button.swatch:hover { border-color: #C8C8C8; }
+.toolbar button.primary {
+    background: #C8C8C8;
+    color: #0D0D0D;
+    border-color: #C8C8C8;
+    font-weight: bold;
+}
+.toolbar button.primary:hover { background: #F0F0F0; }
+.toolbar label { color: #9A9A9A; }
+.canvas { background: #080808; }
+.footer {
+    background: #121212;
+    border-top: 1px solid #2A2A2A;
+    padding: 5px 10px;
+}
+.footer label { color: #7A7A7A; font-size: 9px; }
+combobox button {
+    background: #171717;
+    color: #CFCFCF;
+    border: 1px solid #2A2A2A;
+    padding: 3px 6px;
+}
+popover { background: #121212; border: 1px solid #2A2A2A; }
+popover entry {
+    background: #0D0D0D;
+    color: #F0F0F0;
+    border: 1px solid #2A2A2A;
+    padding: 5px 7px;
+}
+"""
+
+_css_installed = False
+
+
+def install_css() -> None:
+    global _css_installed
+    if _css_installed:
+        return
+    provider = Gtk.CssProvider()
+    provider.load_from_data(EDITOR_CSS)
+    screen = Gdk.Screen.get_default()
+    if screen is not None:
+        Gtk.StyleContext.add_provider_for_screen(
+            screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+    _css_installed = True
+
+
+class Editor(Gtk.Window):
+    def __init__(self, pixbuf: GdkPixbuf.Pixbuf, opts):
+        super().__init__(title="Screenshot")
+        self.opts = opts
+        self.pixbuf = pixbuf
+        self.base_surface = surface_for(pixbuf)
+        self.img_w = pixbuf.get_width()
+        self.img_h = pixbuf.get_height()
+        self.shapes: list[dict] = []
+        self.redo_stack: list[dict] = []
+        self.current: dict | None = None
+        self.tool = "arrow"
+        self.color_name = "Red"
+        self.color = hex_to_rgb(dict(COLORS)["Red"]) + (1.0,)
+        self.width = 3
+        self._sync = False
+        self._busy = False
+        self.text_popover: Gtk.Popover | None = None
+
+        self.set_wmclass("screenshot-editor", "screenshot-editor")
+        self.set_icon_name("camera-photo")
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_resizable(True)
+        self.connect("key-press-event", self.on_key)
+        self.connect("destroy", self.on_destroy)
+
+        display = Gdk.Display.get_default()
+        monitor = display.get_primary_monitor() if display else None
+        geo = monitor.get_geometry() if monitor else None
+        available_w = geo.width if geo else 1920
+        available_h = geo.height if geo else 1080
+        max_w = max(480, int(available_w * 0.86))
+        max_h = max(320, int(available_h * 0.78))
+        scale = min(1.0, max_w / self.img_w, max_h / self.img_h)
+        disp_w = max(420, int(self.img_w * scale))
+        disp_h = max(240, int(self.img_h * scale))
+        self.set_default_size(max(620, disp_w + 20), disp_h + 92)
+
+        self.build_ui()
+
+    # -- UI ---------------------------------------------------------------
+    def build_ui(self) -> None:
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        outer.pack_start(self.build_toolbar(), False, False, 0)
+
+        canvas = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        canvas.get_style_context().add_class("canvas")
+        canvas.set_border_width(10)
+        self.area = Gtk.DrawingArea()
+        self.area.set_size_request(420, 240)
+        self.area.set_hexpand(True)
+        self.area.set_vexpand(True)
+        self.area.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+        )
+        self.area.connect("draw", self.on_area_draw)
+        self.area.connect("button-press-event", self.on_area_press)
+        self.area.connect("button-release-event", self.on_area_release)
+        self.area.connect("motion-notify-event", self.on_area_motion)
+        canvas.pack_start(self.area, True, True, 0)
+        outer.pack_start(canvas, True, True, 0)
+
+        footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        footer.get_style_context().add_class("footer")
+        self.hint = Gtk.Label(label=self.footer_text())
+        self.hint.set_xalign(0)
+        self.hint.set_hexpand(True)
+        self.hint.set_ellipsize(Pango.EllipsizeMode.END)
+        self.size_label = Gtk.Label(label=f"{self.img_w} × {self.img_h}")
+        self.size_label.set_xalign(1)
+        footer.pack_start(self.hint, True, True, 0)
+        footer.pack_end(self.size_label, False, False, 0)
+        outer.pack_start(footer, False, False, 0)
+
+        self.add(outer)
+        self.update_history_buttons()
+
+    def build_toolbar(self) -> Gtk.Box:
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        bar.get_style_context().add_class("toolbar")
+
+        self.tool_buttons: dict[str, Gtk.ToggleButton] = {}
+        for key, glyph, label in TOOLS:
+            button = Gtk.ToggleButton(label=glyph)
+            button.set_relief(Gtk.ReliefStyle.NONE)
+            button.set_tooltip_text(f"{label}  ({key.upper()})")
+            button.get_style_context().add_class("tool")
+            button.connect("toggled", self.on_tool_toggled, key)
+            self.tool_buttons[key] = button
+            bar.pack_start(button, False, False, 0)
+        self.tool_buttons["arrow"].set_active(True)
+
+        bar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 6)
+
+        self.swatches: dict[str, Gtk.DrawingArea] = {}
+        for name, value in COLORS:
+            button = Gtk.Button()
+            button.set_relief(Gtk.ReliefStyle.NONE)
+            button.set_tooltip_text(name)
+            button.get_style_context().add_class("swatch")
+            swatch = Gtk.DrawingArea()
+            swatch.set_size_request(18, 18)
+            swatch.connect("draw", self.on_swatch_draw, name)
+            button.add(swatch)
+            button.connect("clicked", self.on_color_clicked, name)
+            self.swatches[name] = swatch
+            bar.pack_start(button, False, False, 0)
+
+        bar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 6)
+
+        width_label = Gtk.Label(label="Width")
+        bar.pack_start(width_label, False, False, 0)
+        self.width_combo = Gtk.ComboBoxText()
+        for width in (2, 3, 5, 8, 12):
+            self.width_combo.append(str(width), f"{width} px")
+        self.width_combo.set_active_id("3")
+        self.width_combo.set_tooltip_text("Stroke width")
+        self.width_combo.connect("changed", self.on_width_changed)
+        bar.pack_start(self.width_combo, False, False, 0)
+
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        bar.pack_start(spacer, True, True, 0)
+
+        self.undo_button = Gtk.Button.new_from_icon_name("edit-undo-symbolic", Gtk.IconSize.BUTTON)
+        self.undo_button.set_tooltip_text("Undo  (Ctrl+Z)")
+        self.undo_button.connect("clicked", lambda *_: self.undo())
+        bar.pack_start(self.undo_button, False, False, 0)
+
+        self.redo_button = Gtk.Button.new_from_icon_name("edit-redo-symbolic", Gtk.IconSize.BUTTON)
+        self.redo_button.set_tooltip_text("Redo  (Ctrl+Shift+Z)")
+        self.redo_button.connect("clicked", lambda *_: self.redo())
+        bar.pack_start(self.redo_button, False, False, 0)
+
+        bar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 6)
+
+        cancel = Gtk.Button(label="Cancel")
+        cancel.set_tooltip_text("Discard  (Esc)")
+        cancel.connect("clicked", lambda *_: self.discard())
+        bar.pack_start(cancel, False, False, 0)
+
+        copy = Gtk.Button(label="Copy")
+        copy.set_tooltip_text("Copy to clipboard  (Ctrl+C)")
+        copy.connect("clicked", lambda *_: self.action_copy())
+        bar.pack_start(copy, False, False, 0)
+
+        save = Gtk.Button(label="Save")
+        save.set_tooltip_text("Save to ~/Pictures/Screenshots  (Ctrl+S)")
+        save.connect("clicked", lambda *_: self.action_save())
+        bar.pack_start(save, False, False, 0)
+
+        both = Gtk.Button(label="Copy & Save")
+        both.set_tooltip_text("Copy and save  (Enter)")
+        both.get_style_context().add_class("primary")
+        both.connect("clicked", lambda *_: self.action_both())
+        bar.pack_start(both, False, False, 0)
+
+        return bar
+
+    # -- toolbar callbacks ------------------------------------------------
+    def on_tool_toggled(self, button: Gtk.ToggleButton, key: str) -> None:
+        if self._sync:
+            return
+        if not button.get_active():
+            if self.tool == key:
+                self._sync = True
+                button.set_active(True)
+                self._sync = False
+            return
+        self._sync = True
+        self.tool = key
+        self.current = None
+        for other_key, other in self.tool_buttons.items():
+            if other_key != key:
+                other.set_active(False)
+        self._sync = False
+        if getattr(self, "area", None) is not None:
+            self.area.queue_draw()
+        self.update_hint()
+
+    def footer_text(self) -> str:
+        return f"{TOOL_HINTS.get(self.tool, 'Drag to draw')}   ·   {SHORTCUT_HINT}"
+
+    def update_hint(self) -> None:
+        hint = getattr(self, "hint", None)
+        if hint is not None:
+            hint.set_text(self.footer_text())
+
+    def on_swatch_draw(self, widget: Gtk.DrawingArea, cr, name: str):
+        alloc = widget.get_allocation()
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        selected = name == self.color_name
+        inset = 3 if selected else 1
+        if selected:
+            cr.set_source_rgb(*hex_to_rgb(FG))
+            rounded_rect(cr, 0.5, 0.5, alloc.width - 1, alloc.height - 1, 3)
+            cr.fill()
+        value = dict(COLORS)[name]
+        cr.set_source_rgb(*hex_to_rgb(value))
+        rounded_rect(cr, inset, inset, alloc.width - inset * 2, alloc.height - inset * 2, 2)
+        cr.fill()
+        cr.set_source_rgba(0.16, 0.16, 0.16, 1)
+        cr.set_line_width(1)
+        rounded_rect(cr, inset + 0.5, inset + 0.5, alloc.width - inset * 2 - 1, alloc.height - inset * 2 - 1, 2)
+        cr.stroke()
+        return False
+
+    def on_color_clicked(self, _button, name: str) -> None:
+        self.color_name = name
+        self.color = hex_to_rgb(dict(COLORS)[name]) + (1.0,)
+        for swatch in self.swatches.values():
+            swatch.queue_draw()
+
+    def on_width_changed(self, combo: Gtk.ComboBoxText) -> None:
+        active = combo.get_active_id()
+        if active:
+            self.width = int(active)
+
+    # -- history ----------------------------------------------------------
+    def update_history_buttons(self) -> None:
+        self.undo_button.set_sensitive(bool(self.shapes))
+        self.redo_button.set_sensitive(bool(self.redo_stack))
+
+    def undo(self) -> None:
+        if not self.shapes:
+            return
+        self.redo_stack.append(self.shapes.pop())
+        self.update_history_buttons()
+        self.area.queue_draw()
+
+    def redo(self) -> None:
+        if not self.redo_stack:
+            return
+        self.shapes.append(self.redo_stack.pop())
+        self.update_history_buttons()
+        self.area.queue_draw()
+
+    def add_shape(self, shape: dict) -> None:
+        self.shapes.append(shape)
+        self.redo_stack.clear()
+        self.update_history_buttons()
+        self.area.queue_draw()
+
+    # -- view transform ---------------------------------------------------
+    def view_transform(self, aw: int, ah: int):
+        if aw <= 0 or ah <= 0:
+            return 1.0, 0.0, 0.0
+        scale = min(1.0, aw / self.img_w, ah / self.img_h)
+        ox = (aw - self.img_w * scale) / 2.0
+        oy = (ah - self.img_h * scale) / 2.0
+        return scale, ox, oy
+
+    def to_image(self, x: float, y: float):
+        aw = self.area.get_allocated_width()
+        ah = self.area.get_allocated_height()
+        scale, ox, oy = self.view_transform(aw, ah)
+        ix = (x - ox) / scale
+        iy = (y - oy) / scale
+        if ix < 0 or iy < 0 or ix > self.img_w or iy > self.img_h:
+            return None
+        return max(0.0, min(ix, self.img_w - 1)), max(0.0, min(iy, self.img_h - 1))
+
+    # -- canvas painting --------------------------------------------------
+    def on_area_draw(self, widget: Gtk.DrawingArea, cr):
+        aw = widget.get_allocated_width()
+        ah = widget.get_allocated_height()
+        cr.set_source_rgb(0.03, 0.03, 0.03)
+        cr.paint()
+
+        scale, ox, oy = self.view_transform(aw, ah)
+        cr.save()
+        cr.translate(ox, oy)
+        cr.scale(scale, scale)
+        cr.set_source_surface(self.base_surface, 0, 0)
+        cr.get_source().set_filter(cairo.FILTER_GOOD)
+        cr.paint()
+        for shape in self.shapes:
+            draw_shape(cr, shape, self.base_surface)
+        if self.current is not None:
+            draw_shape(cr, self.current, self.base_surface)
+        cr.restore()
+
+        cr.set_source_rgba(0.16, 0.16, 0.16, 1)
+        cr.set_line_width(1)
+        cr.rectangle(ox - 0.5, oy - 0.5, self.img_w * scale + 1, self.img_h * scale + 1)
+        cr.stroke()
+        return False
+
+    # -- canvas interaction ----------------------------------------------
+    def on_area_press(self, _widget, event):
+        if event.button == 3:
+            if self.current is not None:
+                self.current = None
+                self.area.queue_draw()
+            return True
+        if event.button != 1:
+            return False
+        point = self.to_image(event.x, event.y)
+        if point is None:
+            return False
+        ix, iy = point
+
+        if self.tool == "text":
+            self.open_text_popover(int(event.x), int(event.y), ix, iy)
+            return True
+
+        base = {
+            "type": self.tool,
+            "color": self.color,
+            "width": self.width,
+            "x1": ix,
+            "y1": iy,
+            "x2": ix,
+            "y2": iy,
+        }
+        if self.tool == "pen":
+            base = {
+                "type": "pen",
+                "color": self.color,
+                "width": self.width,
+                "points": [(ix, iy)],
+            }
+        self.current = base
+        self.area.queue_draw()
+        return True
+
+    def on_area_motion(self, _widget, event):
+        if self.current is None:
+            return False
+        point = self.to_image(event.x, event.y)
+        if point is None:
+            return False
+        ix, iy = point
+        shift = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
+
+        if self.current["type"] == "pen":
+            last = self.current["points"][-1]
+            if math.hypot(ix - last[0], iy - last[1]) >= 1.0:
+                self.current["points"].append((ix, iy))
+        else:
+            x1, y1 = self.current["x1"], self.current["y1"]
+            if shift:
+                dx, dy = ix - x1, iy - y1
+                if self.current["type"] == "arrow":
+                    angle = math.atan2(dy, dx)
+                    snapped = round(angle / (math.pi / 4)) * (math.pi / 4)
+                    distance = math.hypot(dx, dy)
+                    ix = x1 + math.cos(snapped) * distance
+                    iy = y1 + math.sin(snapped) * distance
+                else:
+                    side = max(abs(dx), abs(dy))
+                    ix = x1 + (side if dx >= 0 else -side)
+                    iy = y1 + (side if dy >= 0 else -side)
+            self.current["x2"] = ix
+            self.current["y2"] = iy
+        self.area.queue_draw()
+        return True
+
+    def on_area_release(self, _widget, event):
+        if event.button != 1 or self.current is None:
+            return False
+        shape = self.current
+        self.current = None
+        kind = shape["type"]
+        if kind == "pen":
+            valid = len(shape["points"]) >= 2
+        elif kind == "arrow":
+            valid = math.hypot(shape["x2"] - shape["x1"], shape["y2"] - shape["y1"]) >= 4
+        else:
+            valid = abs(shape["x2"] - shape["x1"]) >= 3 and abs(shape["y2"] - shape["y1"]) >= 3
+        if valid:
+            self.add_shape(shape)
+        self.area.queue_draw()
+        return True
+
+    # -- text -------------------------------------------------------------
+    def open_text_popover(self, screen_x: int, screen_y: int, ix: float, iy: float) -> None:
+        if self.text_popover is not None:
+            self.text_popover.popdown()
+            self.text_popover = None
+
+        popover = Gtk.Popover.new(self.area)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.set_border_width(6)
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("Text…")
+        entry.set_width_chars(24)
+        add = Gtk.Button(label="Add")
+        add.get_style_context().add_class("primary")
+        box.pack_start(entry, True, True, 0)
+        box.pack_start(add, False, False, 0)
+        popover.add(box)
+
+        def commit(*_args):
+            text = entry.get_text().strip()
+            if text:
+                self.add_shape(
+                    {
+                        "type": "text",
+                        "text": text,
+                        "x": ix,
+                        "y": iy,
+                        "size": 18 + self.width * 2,
+                        "color": self.color,
+                    }
+                )
+            popover.popdown()
+
+        def on_entry_key(_entry, event):
+            if event.keyval == Gdk.KEY_Escape:
+                popover.popdown()
+                return True
+            return False
+
+        entry.connect("activate", commit)
+        entry.connect("key-press-event", on_entry_key)
+        add.connect("clicked", commit)
+
+        def closed(*_args):
+            if self.text_popover is popover:
+                self.text_popover = None
+
+        popover.connect("closed", closed)
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = screen_x, screen_y, 1, 1
+        popover.set_pointing_to(rect)
+        popover.show_all()
+        popover.popup()
+        entry.grab_focus()
+        self.text_popover = popover
+
+    # -- keyboard ---------------------------------------------------------
+    def on_key(self, _widget, event):
+        if self.text_popover is not None and self.text_popover.get_visible():
+            return False
+        key = Gdk.keyval_name(event.keyval) or ""
+        lower = key.lower()
+        ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
+
+        if key == "Escape":
+            self.discard()
+            return True
+        if key in ("Return", "KP_Enter") and not ctrl:
+            self.action_both()
+            return True
+        if ctrl and lower == "c":
+            self.action_copy()
+            return True
+        if ctrl and lower == "s":
+            if shift:
+                self.action_both()
+            else:
+                self.action_save()
+            return True
+        if ctrl and lower == "z":
+            self.redo() if shift else self.undo()
+            return True
+        if ctrl and lower == "y":
+            self.redo()
+            return True
+        if not ctrl and not shift and lower in ("a", "r", "o", "p", "t", "b"):
+            tool = {
+                "a": "arrow",
+                "r": "rect",
+                "o": "ellipse",
+                "p": "pen",
+                "t": "text",
+                "b": "pixelate",
+            }[lower]
+            button = self.tool_buttons[tool]
+            button.set_active(True)
+            return True
+        return False
+
+    # -- export / actions -------------------------------------------------
+    def export_png(self, path: str) -> None:
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.img_w, self.img_h)
+        cr = cairo.Context(surface)
+        cr.set_source_surface(self.base_surface, 0, 0)
+        cr.paint()
+        for shape in self.shapes:
+            draw_shape(cr, shape, self.base_surface)
+        surface.write_to_png(path)
+        surface.flush()
+
+    def dimensions(self) -> str:
+        return f"{self.img_w} × {self.img_h}"
+
+    def discard(self) -> None:
+        self.destroy()
+
+    def action_copy(self) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        path = temp_png()
+        try:
+            self.export_png(path)
+        except Exception as exc:
+            self._busy = False
+            _unlink_quietly(path)
+            notify("Could not render screenshot", str(exc), icon="dialog-error", urgency="critical")
+            return
+        if copy_to_clipboard(path):
+            notify("Copied to clipboard", self.dimensions(), icon="edit-copy")
+            self.destroy()
+        else:
+            self._busy = False
+            _unlink_quietly(path)
+            notify(
+                "Could not copy to clipboard",
+                "The clipboard helper is not running.",
+                icon="dialog-error",
+                urgency="critical",
+            )
+
+    def action_save(self) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        path = resolve_save_path(self.opts)
+        try:
+            os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+            self.export_png(path)
+        except Exception as exc:
+            self._busy = False
+            notify("Could not save screenshot", str(exc), icon="dialog-error", urgency="critical")
+            return
+        notify("Screenshot saved", path, icon=path)
+        self.destroy()
+
+    def action_both(self) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        path = resolve_save_path(self.opts)
+        try:
+            os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+            self.export_png(path)
+        except Exception as exc:
+            self._busy = False
+            notify("Could not save screenshot", str(exc), icon="dialog-error", urgency="critical")
+            return
+        if copy_to_clipboard(path):
+            notify("Saved & copied", path, icon=path)
+        else:
+            notify("Screenshot saved", path + "\n(clipboard unavailable)", icon=path)
+        self.destroy()
+
+    def on_destroy(self, *_args):
+        Gtk.main_quit()
+
+
+def run_editor(pixbuf: GdkPixbuf.Pixbuf, opts) -> None:
+    install_css()
+    editor = Editor(pixbuf, opts)
+    editor.show_all()
+    editor.present()
+    Gtk.main()
+
+
+# ---------------------------------------------------------------------------
+# Non-interactive actions
+# ---------------------------------------------------------------------------
+
+
+def save_pixbuf(pixbuf: GdkPixbuf.Pixbuf, path: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), mode=0o755, exist_ok=True)
+    pixbuf.savev(os.path.abspath(path), "png", [], [])
+
+
+def copy_pixbuf(pixbuf: GdkPixbuf.Pixbuf) -> bool:
+    path = temp_png()
+    try:
+        pixbuf.savev(path, "png", [], [])
+    except Exception as exc:
+        log(f"copy pixbuf: {exc}")
+        _unlink_quietly(path)
+        return False
+    if copy_to_clipboard(path):
+        return True
+    _unlink_quietly(path)
+    return False
+
+
+def _unlink_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def apply_actions(pixbuf: GdkPixbuf.Pixbuf, mode: str, opts) -> int:
+    do_copy = opts.copy
+    do_save = opts.save or bool(opts.path)
+    if not do_copy and not do_save:
+        if mode in ("full",):
+            do_copy = True
+        elif mode in ("save",):
+            do_copy = do_save = True
+        else:
+            do_copy = True
+
+    saved: str | None = None
+    if do_save:
+        saved = resolve_save_path(opts)
+        try:
+            save_pixbuf(pixbuf, saved)
+        except Exception as exc:
+            return fail("Could not save screenshot", str(exc))
+
+    copied = copy_pixbuf(pixbuf) if do_copy else False
+
+    if saved and copied:
+        notify("Saved & copied", saved, icon=saved)
+    elif saved and do_copy:
+        notify("Screenshot saved", saved + "\n(clipboard unavailable)", icon=saved)
+    elif saved:
+        notify("Screenshot saved", saved, icon=saved)
+    elif copied:
+        notify("Copied to clipboard", f"{pixbuf.get_width()} × {pixbuf.get_height()}", icon="edit-copy")
+    else:
+        return fail("Could not copy screenshot", "The clipboard helper is unavailable.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Modes
+# ---------------------------------------------------------------------------
+
+
+def parse_rect(value: str) -> tuple[int, int, int, int]:
+    parts = [p.strip() for p in value.replace("x", ",").split(",")]
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError("expected X,Y,W,H")
+    try:
+        return tuple(int(p) for p in parts)  # type: ignore[return-value]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("X,Y,W,H must be integers") from exc
+
+
+def acquire_lock():
+    path = os.path.join(runtime_dir(), "screenshot.lock")
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    os.ftruncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode("ascii"))
+    return fd
+
+
+def run_mode(opts) -> int:
+    if opts.delay > 0:
+        time.sleep(opts.delay)
+
+    try:
+        if opts.mode == "window":
+            pixbuf = capture_window_pixbuf()
+        elif opts.rect:
+            root = capture_root_pixbuf()
+            pixbuf = crop_pixbuf(root, *opts.rect)
+        else:
+            root = capture_root_pixbuf()
+            if opts.mode == "region":
+                rect = RegionSelector.select(root)
+                if rect is None:
+                    return 0
+                pixbuf = crop_pixbuf(root, *rect)
+            else:
+                pixbuf = root
+    except Exception as exc:
+        return fail("Could not capture the screen", str(exc))
+
+    wants_editor = opts.edit or (opts.mode in ("region", "window") and not opts.no_edit)
+    if wants_editor:
+        run_editor(pixbuf, opts)
+        return 0
+    return apply_actions(pixbuf, opts.mode, opts)
+
+
+def menu() -> int:
+    if not shutil.which("rofi"):
+        return fail("The screenshot menu needs rofi", "Install rofi or use the Print keys directly.")
+    entries = [
+        ("Region  ·  select & annotate", ["region"]),
+        ("Window  ·  capture focused & annotate", ["window"]),
+        ("Full screen  ·  copy to clipboard", ["full"]),
+        ("Full screen  ·  save & copy", ["save"]),
+        ("Region  ·  3 second delay", ["region", "--delay", "3"]),
+        ("Open screenshots folder", None),
+    ]
+    text = "\n".join(label for label, _ in entries)
+    try:
+        proc = subprocess.run(
+            ["rofi", "-dmenu", "-i", "-no-custom", "-p", "Screenshot", "-mesg", "Capture · annotate · copy"],
+            input=text,
+            text=True,
+            capture_output=True,
+        )
+    except OSError as exc:
+        return fail("Could not open the screenshot menu", str(exc))
+    if proc.returncode != 0:
+        return 0
+    choice = proc.stdout.strip()
+    for label, args in entries:
+        if label == choice:
+            if args is None:
+                folder = pictures_dir()
+                os.makedirs(folder, mode=0o755, exist_ok=True)
+                subprocess.Popen(["xdg-open", folder], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return 0
+            subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), *args],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return 0
+    return 0
+
+
+def doctor() -> int:
+    fifo, _ = _clip_paths()
+    rows = [
+        ("display", os.environ.get("DISPLAY") or "not set"),
+        ("session", os.environ.get("XDG_SESSION_TYPE") or "unknown"),
+        ("ImageMagick import", shutil.which("import") or "MISSING"),
+        ("GTK 3 / PyGObject", "ok"),
+        ("python-cairo", cairo.version),
+        ("notifications", shutil.which("notify-send") or "missing (optional)"),
+        ("clipboard helper", f"{'running' if _clip_alive() else 'stopped'}  ({fifo})"),
+        ("i3", shutil.which("i3-msg") or "missing (optional)"),
+        ("rofi", shutil.which("rofi") or "missing (optional)"),
+        ("save folder", pictures_dir()),
+    ]
+    width = max(len(label) for label, _ in rows) + 2
+    print(f"screenshot {APP_VERSION}")
+    print()
+    for label, value in rows:
+        print(f"  {label:<{width}} {value}")
+    print()
+    ok = bool(shutil.which("import")) and os.environ.get("DISPLAY")
+    print("ready" if ok else "not ready — install ImageMagick and run inside X11")
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="screenshot",
+        description="Capture, annotate, copy and save screenshots on X11/i3.",
+        epilog="Keybindings: Print = region, Shift+Print = full→clipboard, "
+               "Super+Print = full→save, Super+Shift+S = menu.",
+    )
+    parser.add_argument(
+        "mode",
+        nargs="?",
+        default="region",
+        choices=("region", "window", "full", "save", "menu"),
+        help="capture mode (default: region)",
+    )
+    parser.add_argument("--delay", type=float, default=0.0, metavar="SECONDS",
+                        help="wait before capturing (useful for menus/tooltips)")
+    parser.add_argument("--no-edit", action="store_true",
+                        help="skip the annotation editor for region/window captures")
+    parser.add_argument("--edit", action="store_true",
+                        help="open the annotation editor even for full/save captures")
+    parser.add_argument("--copy", action="store_true",
+                        help="copy the result to the clipboard (non-editor modes)")
+    parser.add_argument("--save", action="store_true",
+                        help="save the result (non-editor modes)")
+    parser.add_argument("--path", metavar="PATH",
+                        help="save to PATH (or into PATH/ if it is a directory)")
+    parser.add_argument("--rect", type=parse_rect, metavar="X,Y,W,H",
+                        help="capture this rectangle instead of asking (region mode)")
+    parser.add_argument("--doctor", action="store_true", help="check dependencies and exit")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
+    parser.add_argument("--clipboard-daemon", action="store_true", help=argparse.SUPPRESS)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    opts = parse_args(argv)
+    if opts.clipboard_daemon:
+        return clipboard_daemon()
+    if opts.doctor:
+        return doctor()
+    if opts.mode == "menu":
+        return menu()
+    if not os.environ.get("DISPLAY"):
+        return fail("No X11 display found", "This tool is for the X11/i3 session.")
+
+    lock = acquire_lock()
+    if lock is None:
+        notify("Screenshot already in progress", "Finish or cancel the open grab first.", icon="dialog-information")
+        return 0
+    try:
+        return run_mode(opts)
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            os.close(lock)
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

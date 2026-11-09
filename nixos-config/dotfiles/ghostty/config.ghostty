@@ -1,0 +1,64 @@
+# ~/.config/ghostty/config.ghostty
+# Minimal monochrome Ghostty — neutral grayscale tuned to the
+# i3 / Polybar / wallpaper palette (#0D0D0D → #F0F0F0).
+
+# ---- Window ----
+window-width = 100
+window-height = 30
+window-decoration = false
+gtk-single-instance = false
+background-opacity = 0.90
+window-padding-x = 14
+window-padding-y = 12
+window-padding-balance = true
+window-save-state = never
+confirm-close-surface = false
+
+# ---- Font ----
+font-family = "JetBrainsMono Nerd Font Mono"
+font-size = 9
+
+# ---- Cursor (bar, no blinking) ----
+cursor-style = bar
+cursor-style-blink = false
+cursor-color = #f0f0f0
+cursor-text = #0d0d0d
+
+# ---- Selection (copy on select) ----
+selection-foreground = #f2f2f2
+selection-background = #3a3a3a
+copy-on-select = both
+
+# ---- Mouse ----
+mouse-hide-while-typing = true
+
+# ---- Scrollback (10000 lines) ----
+scrollback-limit-lines = 10000
+
+# ---- Base colors ----
+background = #0d0d0d
+foreground = #e6e6e6
+# Bold text uses the bright half of the palette
+bold-color = bright
+
+# ---- ANSI palette (grayscale ramp) ----
+palette = 0=#242424
+palette = 1=#8a8a8a
+palette = 2=#a6a6a6
+palette = 3=#d6d6d6
+palette = 4=#6e6e6e
+palette = 5=#9c9c9c
+palette = 6=#c2c2c2
+palette = 7=#e6e6e6
+palette = 8=#4a4a4a
+palette = 9=#b4b4b4
+palette = 10=#c8c8c8
+palette = 11=#f0f0f0
+palette = 12=#909090
+palette = 13=#bebebe
+palette = 14=#dedede
+palette = 15=#ffffff
+
+# ----Resize Overlay-----
+#
+resize-overlay = never

@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+#
+# lazydocker-window - toggle lazydocker in a floating window.
+#
+# i3 owns the appearance (see ~/.config/i3/config):
+#   for_window [class="^lazydocker\.local$"] mark --replace lazydocker,
+#       floating enable, move position center, move scratchpad
+# so this script starts lazydocker on first use and afterwards toggles the
+# parked scratchpad window with each press of Alt+D.
+#
+# The size comes from Ghostty's cell grid (COLS x ROWS), not from an i3 pixel
+# resize: forcing pixels makes Ghostty snap back to its grid after mapping.
+# Ghostty only settles on its real cell size once the window is realised, so
+# show_focus() makes it transparent first and only reveals it after that.
+set -u
+
+CLASS=lazydocker.local
+APP=(lazydocker)
+TERM_CMD="${TERMINAL:-ghostty}"
+# Cell grid requested from Ghostty (roughly the same footprint as btop).
+COLS=140
+ROWS=40
+
+have_i3() {
+    command -v i3-msg >/dev/null 2>&1 && i3-msg -t get_version >/dev/null 2>&1
+}
+
+msgs() { i3-msg "[class=\"^${CLASS//./\\.}\$\"] $1" >/dev/null 2>&1; }
+
+# "<workspace>\t<focused>" for the terminal window, or nothing if it is not there.
+# A parked scratchpad window lives under the __i3_scratch workspace, which is
+# how "show it" is told apart from "it is already up".
+window_state() {
+    local tree
+    tree=$(i3-msg -t get_tree 2>/dev/null) || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    jq -r --arg c "$CLASS" '
+        def scan($ws):
+            (if .type == "workspace" then .name else $ws end) as $w
+            | if ((.window_properties // {}).class // "") == $c
+              then "\($w)\t\(.focused // false)"
+              else (((.nodes // [])[] | scan($w)),
+                    ((.floating_nodes // [])[] | scan($w)))
+              end;
+        scan("")' <<<"$tree" 2>/dev/null | head -n1
+}
+
+window_exists() {
+    local tree
+    tree=$(i3-msg -t get_tree 2>/dev/null) || return 1
+    if command -v jq >/dev/null 2>&1; then
+        jq -e --arg c "$CLASS" \
+            '.. | objects | select((.window_properties // {}).class == $c)' \
+            <<<"$tree" >/dev/null 2>&1
+    else
+        grep -q "\"class\":\"$CLASS\"" <<<"$tree"
+    fi
+}
+
+window_size() {
+    i3-msg -t get_tree 2>/dev/null |
+        jq -r --arg c "$CLASS" \
+            '.. | objects | select((.window_properties // {}).class == $c)
+             | "\(.rect.width)x\(.rect.height)"' 2>/dev/null | head -n1
+}
+
+window_id() {
+    i3-msg -t get_tree 2>/dev/null |
+        jq -r --arg c "$CLASS" \
+            '.. | objects | select((.window_properties // {}).class == $c)
+             | .window' 2>/dev/null | head -n1
+}
+
+# Hide/show the client via picom's _NET_WM_WINDOW_OPACITY property. The property
+# can be set while the window is still parked, so it is already transparent at
+# the moment it is mapped and all of Ghostty's post-map resizing happens
+# unseen. No-op if xprop or picom is unavailable.
+set_opacity() {
+    local wid
+    command -v xprop >/dev/null 2>&1 || return 0
+    wid=$(window_id)
+    [[ -n $wid && $wid != null ]] || return 0
+    if [[ $1 == hidden ]]; then
+        xprop -id "$wid" -f _NET_WM_WINDOW_OPACITY 32c \
+            -set _NET_WM_WINDOW_OPACITY 0 >/dev/null 2>&1
+    else
+        xprop -id "$wid" -remove _NET_WM_WINDOW_OPACITY >/dev/null 2>&1
+    fi
+    return 0
+}
+
+# Ghostty resizes itself to its real terminal grid just after the window is
+# mapped. Wait until the size stops changing so the centring below uses the
+# final dimensions (this runs while the window is transparent).
+settle() {
+    local prev cur i stable=0
+    command -v jq >/dev/null 2>&1 || return 0
+    prev=$(window_size) || return 0
+    [[ -n $prev ]] || return 0
+    for i in $(seq 1 30); do
+        sleep 0.03
+        cur=$(window_size)
+        if [[ -n $cur && $cur == "$prev" ]]; then
+            stable=$((stable + 1))
+            (( stable >= 2 )) && return 0
+        else
+            stable=0
+        fi
+        prev=$cur
+    done
+    return 0
+}
+
+# Show the parked window already in its final state: reveal it from the
+# scratchpad while transparent, wait for Ghostty to settle its size, centre it,
+# then remove the transparency. It therefore appears directly at its final size
+# and position instead of visibly resizing or jumping.
+show_focus() {
+    local state i
+    set_opacity hidden
+    msgs "scratchpad show"
+    settle
+    msgs "move position center"
+    set_opacity visible
+    for i in $(seq 1 12); do
+        msgs "focus"
+        state=$(window_state)
+        [[ ${state##*$'\t'} == true ]] && break
+        sleep 0.05
+    done
+    return 0
+}
+
+focus_only() {
+    local state i
+    for i in $(seq 1 12); do
+        msgs "focus"
+        state=$(window_state)
+        [[ ${state##*$'\t'} == true ]] && return 0
+        sleep 0.05
+    done
+    return 0
+}
+
+hide_window() { msgs "move scratchpad"; }
+
+toggle() {
+    local state ws focused
+    state=$(window_state) || state=""
+    if [[ -z $state ]]; then
+        # no jq (or a race): fall back to i3's own scratchpad toggle
+        show_focus
+        return 0
+    fi
+    ws=${state%%$'\t'*}
+    focused=${state##*$'\t'}
+    if [[ $ws == "__i3_scratch" ]]; then
+        show_focus          # parked -> show
+    elif [[ $focused == true ]]; then
+        hide_window         # up and focused -> hide
+    else
+        focus_only          # up but unfocused -> just focus
+    fi
+}
+
+# Outside i3 (plain shell): just run a floating-size terminal in place.
+if ! have_i3; then
+    exec "$TERM_CMD" --class="$CLASS" --title="lazydocker" \
+        --window-width="$COLS" --window-height="$ROWS" -e "${APP[@]}"
+fi
+
+if window_exists; then
+    toggle
+    exit 0
+fi
+
+"$TERM_CMD" --class="$CLASS" --title="lazydocker" \
+    --window-width="$COLS" --window-height="$ROWS" -e "${APP[@]}" >/dev/null 2>&1 &
+
+# for_window parks the new window in the scratchpad, so wait until it exists
+# and then pull it onto the current workspace and focus it.
+for _ in $(seq 1 100); do
+    if window_exists; then
+        sleep 0.1           # let the for_window rule park it first
+        show_focus
+        exit 0
+    fi
+    sleep 0.05
+done
+
+exit 1

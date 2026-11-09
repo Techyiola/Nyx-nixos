@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Brightness keys for i3: raise / lower, with the minimal xob OSD.
+#
+#   brightness up|down
+#
+# Talks to systemd-logind over D-Bus, so no root, no setuid helper and no
+# extra packages are needed. Clamped to 1..100% so the panel never goes black
+# (the bar stays usable even if you hold the key down).
+
+set -u
+
+osd=$HOME/.local/bin/osd
+step=5
+min=1
+max=100
+
+# Internal panel backlight (first entry in /sys/class/backlight).
+dev=
+for d in /sys/class/backlight/*; do
+    [[ -e $d ]] || continue
+    dev=${d##*/}
+    [[ -r $d/brightness && -r $d/max_brightness ]] && break
+done
+
+if [[ -z $dev ]]; then
+    notify-send -a brightness "Brightness" "No backlight device found"
+    exit 1
+fi
+
+sys=/sys/class/backlight/$dev
+cur=$(<"$sys/brightness")
+top=$(<"$sys/max_brightness")
+(( top > 0 )) || exit 1
+
+# Current level as a percentage, rounded.
+pct=$(( (cur * 100 + top / 2) / top ))
+
+case ${1:-} in
+    up)   target=$(( pct + step )) ;;
+    down) target=$(( pct - step )) ;;
+    *)
+        echo "usage: brightness up|down" >&2
+        exit 1
+        ;;
+esac
+
+(( target > max )) && target=$max
+(( target < min )) && target=$min
+
+raw=$(( target * top / 100 ))
+(( raw < 1 )) && raw=1
+
+if ! busctl call org.freedesktop.login1 /org/freedesktop/login1/session/self \
+        org.freedesktop.login1.Session SetBrightness ssu \
+        backlight "$dev" "$raw" >/dev/null 2>&1; then
+    # Fallbacks for systems where logind can't set the backlight.
+    if command -v brightnessctl >/dev/null 2>&1; then
+        brightnessctl set "${target}%" >/dev/null
+    elif command -v light >/dev/null 2>&1; then
+        light -S "$target" >/dev/null
+    else
+        notify-send -a brightness "Brightness" "Could not set backlight ($dev)"
+        exit 1
+    fi
+fi
+
+"$osd" brightness "$target"

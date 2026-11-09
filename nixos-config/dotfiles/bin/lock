@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+#
+# lock — minimal Darkspace lockscreen (i3lock-color)
+#
+# Layout:  big thin clock  →  small date  →  slim keypress bar
+# Colors match the i3 "Darkspace palette" (see ~/.config/i3/config).
+#
+# Usage:
+#   lock              lock the screen (used by Super+L)
+#   lock preview      lock for 12s then auto-unlock, so you can play with it
+#   extra args are passed straight through to i3lock
+
+args=(
+    --blur 8
+
+    # --- slim horizontal keypress bar (replaces the dial) ---
+    --bar-indicator
+    --bar-orientation horizontal
+    --bar-count 40
+    --bar-total-width 280
+    --bar-base-width 4
+    --bar-max-height 10
+    # bar-step 2 (was 8) tapers each keypress into a smooth hill instead of a
+    # single isolated spike: neighbours fall off 2px per bar.
+    --bar-step 2
+    # periodic-step 1 with a fast refresh rate = the hill fades 1px per frame
+    # (~10fps → 10px/s), which reads as smooth motion rather than jumps.
+    --bar-periodic-step 1
+    --refresh-rate 0.1
+    --bar-direction 2
+    --bar-color 3C5C89ff
+    # bar-pos sets the bar's LEFT edge, so subtract half the bar width
+    --bar-pos "x+w/2-140:y+h/2+50"
+    # ind-pos also drives where the status text ("verifying…"/"wrong") and the
+    # failed-attempt count are drawn. Keep it well below the bar so the feedback
+    # never crowds the date, and the clock stays put (--force-clock).
+    --ind-pos "x+w/2:y+h/2+92"
+
+    # --- bar feedback colors (base bar borrows ring colors while verifying) ---
+    --keyhl-color A8BEE1ff
+    --bshl-color BF616Aff
+    --separator-color 3C5C89ff
+    --ringver-color A8BEE1ff
+    --ringwrong-color BF616Aff
+    --inside-color 0B0F17ff
+    --insidever-color 0B0F17ff
+    --insidewrong-color 0B0F17ff
+
+    # --- clock ---
+    # --force-clock keeps the clock visible while indicator text
+    # ("verifying…" / "wrong") is on screen; plain --clock hides it.
+    --force-clock
+    --time-str "%H:%M"
+    --time-font "Fira Sans Thin"
+    --time-size 76
+    --time-color EAF0FAff
+    --time-pos "x+w/2:y+h/2-70"
+
+    # --- date ---
+    --date-str "%A, %d %B"
+    --date-font "Fira Sans"
+    --date-size 15
+    --date-color A8BEE1ff
+    --date-pos "x+w/2:y+h/2-12"
+
+    # --- status text ---
+    --verif-text "verifying…"
+    --verif-font "Fira Sans"
+    --verif-size 14
+    --verif-color A8BEE1ff
+    --wrong-text "wrong"
+    --wrong-font "Fira Sans"
+    --wrong-size 14
+    --wrong-color BF616Aff
+    --noinput-text ""
+
+    # --- declutter ---
+    --no-modkey-text
+    --show-failed-attempts
+)
+
+runner=(i3lock)
+if [[ "${1:-}" == "preview" ]]; then
+    shift
+    runner=(timeout -s KILL "${LOCK_PREVIEW_SECS:-12}" i3lock --nofork)
+fi
+
+# Retry up to 3x: i3lock can fail with "Cannot grab pointer/keyboard" if
+# another client briefly holds an X grab. Only retry fast failures, so a
+# preview timeout (or a real unlock) never re-locks the screen.
+for _ in 1 2 3; do
+    start=$SECONDS
+    "${runner[@]}" "${args[@]}" "$@" && exit 0
+    (( SECONDS - start >= 2 )) && exit 1
+    sleep 0.3
+done
+exit 1
